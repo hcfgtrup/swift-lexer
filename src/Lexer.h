@@ -1,332 +1,343 @@
 #pragma once//защита от повторного включения заголовочного файла
-#include "Token.h"//подключаем структуры токенов
-#include "Keywords.h"//подключаем список ключевых слов Swift
-#include <string>//подключаем строки
-#include <cctype>//подключаем функции классификации символов (std::isdigit, std::isalpha и др.)
-#include <stdexcept>//подключаем стандартные исключения (std::runtime_error)
-#include <vector>//подключаем векторы
+#include "Token.h"//подключаем структуру Token, лексер её заполняет
+#include "Keywords.h"//подключаем список ключевых слов, чтобы отличать их от идентификаторов
+#include <string>//строки, нужны для хранения исходника и результата
+#include <cctype>//isdigit/isalpha/isspace/isxdigit, нужны для классификации символов
+#include <stdexcept>//runtime_error, нужен для фатальных ошибок
+#include <vector>//vector, нужен для списка многосимвольных операторов
 
-//класс Lexer отвечает за чтение исходного текста и превращение его в поток токенов
-class Lexer {
+class Lexer {//класс, который читает текст посимвольно и выдаёт токены
 public:
-    //конструктор класса: принимает исходный код программы в виде строки и имя файла
-    Lexer(const std::string& source, const std::string& filename)
-        : src(source), file(filename), pos(0), line(1), col(1) {}//инициализируем поля: позиция 0, строка 1, колонка 1
+    Lexer(const std::string& source, const std::string& filename)//конструктор получает весь текст файла и его имя
+        : src(source), file(filename), pos(0), line(1), col(1) {}//запоминаем текст, имя, начинаем с позиции 0, строки 1, колонки 1
 
-    //основной метод для получения следующего токена. возвращает true, если токен найден, или false, если файл кончился
-    bool nextToken(Token& out) {
-        skipWhitespaceAndComments();//пропускаем все пробелы, табуляции, переносы строк и комментарии перед токеном
-        if (pos >= src.size()) return false;//если дошли до конца исходного текста, возвращаем false (прекращаем разбор)
+    bool nextToken(Token& out) {//главный метод, возвращает true, если токен есть, и false, если файл кончился
+        skipWhitespaceAndComments();//пропускаем пробелы и комментарии, они не токены
+        if (pos >= src.size()) return false;//если дошли до конца файла, сообщаем что токенов больше нет
 
-        out.file = file;//записываем в исходящий токен текущее имя файла
-        out.line = line;//записываем текущий номер строки
-        out.column = col;//записываем текущую колонку
+        out.file = file;//запоминаем в токене имя файла
+        out.line = line;//запоминаем номер строки
+        out.column = col;//запоминаем номер колонки
 
-        char c = src[pos];//берем текущий символ, на который указывает каретка разбора
+        char c = src[pos];//берём текущий символ
 
-        //добавлено: обработка raw-идентификаторов в backticks (`class`, `if`, `100`).
-        //по спецификации Swift 6.2+ backtick-идентификатор — это обычный идентификатор,
-        //который может содержать ключевое слово или цифру в начале
-        if (c == '`') {
-            out.type = TokenType::IDENTIFIER;//считаем его идентификатором
+        //важно: проверка extended-строки должна идти ДО обработки #, иначе #"..."# разобьётся на # + строка + #
+        if (c == '#' && peek(1) == '"') {//если это начало extended-строки #"..."#
+            out.type = TokenType::STRING;//это строка
+            out.value = readString();//читаем строку целиком, readString сам разберётся с #
+            return true;//токен готов
+        }
+
+        if (c == '#') {//если символ #, это либо #-ключевое слово, либо оператор #
+            std::string hashtag = readHashKeyword();//пробуем прочитать "#" + слово
+            if (!hashtag.empty() && swiftKeywords().count(hashtag)) {//если получилось и слово есть в списке ключевых
+                out.type = TokenType::KEYWORD;//это ключевое слово
+                out.value = hashtag;//например "#available"
+                return true;//токен готов
+            }
+            out.type = TokenType::OPERATOR;//иначе это просто оператор #
+            out.value = "#";//значение — решётка
+            advance();//сдвигаемся на один символ
+            return true;//токен готов
+        }
+
+        if (c == '$') {//если символ $, это $-идентификатор ($0, $1, $published)
+            std::string dollarId = readDollarIdentifier();//читаем $ + цифры или буквы
+            if (dollarId.size() > 1) {//если после $ что-то есть
+                out.type = TokenType::IDENTIFIER;//это идентификатор
+                out.value = dollarId;//например "$0" или "$published"
+                return true;//токен готов
+            }
+            out.type = TokenType::UNKNOWN;//если $ без продолжения, это ошибка
+            out.value = "$";//значение — доллар
+            return true;//токен готов
+        }
+
+        if (c == '`') {//если символ `, это raw-идентификатор в backticks (`class`)
+            out.type = TokenType::IDENTIFIER;//это идентификатор
             out.value = readRawIdentifier();//читаем содержимое между backticks
-            return true;//возвращаем успешный результат
+            return true;//токен готов
         }
 
-        //если символ является цифрой...
-        if (std::isdigit(static_cast<unsigned char>(c))) {
-            out.type = TokenType::NUMBER;//устанавливаем тип токена: Число
-            out.value = readNumber();//считываем число целиком с помощью вспомогательного метода
-            return true;//возвращаем успешный результат
+        if (std::isdigit(static_cast<unsigned char>(c))) {//если символ цифра
+            out.type = TokenType::NUMBER;//это число
+            out.value = readNumber();//читаем число целиком
+            return true;//токен готов
         }
 
-        //если символ является открывающей кавычкой...
-        if (c == '"') {
-            out.type = TokenType::STRING;//устанавливаем тип токена: Строка
-            out.value = readString();//считываем строковый литерал целиком
-            return true;//возвращаем успешный результат
+        if (c == '"') {//если открывающая кавычка, это обычная или многострочная строка
+            out.type = TokenType::STRING;//это строка
+            out.value = readString();//читаем строку целиком
+            return true;//токен готов
         }
 
-        //если символ является буквой или знаком подчеркивания...
-        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
-            std::string word = readIdentifier();//считываем слово (идентификатор или потенциальное ключевое слово) целиком
-            //проверяем, входит ли считанное слово во множество ключевых слов Swift
-            if (swiftKeywords().count(word)) {
-                out.type = TokenType::KEYWORD;//если входит, это Ключевое слово
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {//если буква или подчёркивание
+            std::string word = readIdentifier();//читаем слово целиком
+            if (swiftKeywords().count(word)) {//если слово есть в списке ключевых
+                out.type = TokenType::KEYWORD;//это ключевое слово
             } else {
-                out.type = TokenType::IDENTIFIER;//если не входит, это обычный Идентификатор
+                out.type = TokenType::IDENTIFIER;//иначе это идентификатор
             }
-            out.value = word;//сохраняем текстовое значение слова в токен
-            return true;//возвращаем успешный результат
+            out.value = word;//сохраняем текст
+            return true;//токен готов
         }
 
-        //пытаемся считать оператор или разделитель
-        std::string op = readOperatorOrDelimiter();
-        if (!op.empty()) {//если что-то было успешно считано...
-            //проверяем, является ли это одиночным разделителем из списка символов
-            if (op.size() == 1 &&
-                std::string("(){}[];,:").find(op[0]) != std::string::npos) {
-                out.type = TokenType::DELIMITER;//устанавливаем тип: Разделитель
+        std::string op = readOperatorOrDelimiter();//пробуем прочитать оператор или разделитель
+        if (!op.empty()) {//если что-то прочитали
+            if (op.size() == 1 && std::string("(){}[];,:").find(op[0]) != std::string::npos) {//если это одиночный символ из списка разделителей
+                out.type = TokenType::DELIMITER;//это разделитель
             } else {
-                out.type = TokenType::OPERATOR;//иначе это многосимвольный или одиночный Оператор
+                out.type = TokenType::OPERATOR;//иначе это оператор
             }
-            out.value = op;//записываем оператор/разделитель в токен
-            return true;//возвращаем успешный результат
+            out.value = op;//сохраняем текст
+            return true;//токен готов
         }
 
-        //если ни одно правило выше не подошло, значит символ неизвестный (лексическая ошибка)
-        out.type = TokenType::UNKNOWN;//устанавливаем тип: Ошибка
-        out.value = std::string(1, c);//записываем этот ошибочный символ в значение
-        advance();//продвигаем позицию вперед, чтобы не зациклиться на одном символе
-        return true;//возвращаем токен ошибки
+        out.type = TokenType::UNKNOWN;//если ничего не подошло, это неизвестный символ
+        out.value = std::string(1, c);//значение — сам символ
+        advance();//сдвигаемся, чтобы не зациклиться
+        return true;//токен готов
     }
 
 private:
-    std::string src;//исходный текст программы целиком
-    std::string file;//имя анализируемого файла
-    size_t pos;//текущий индекс (позиция) в строке src
-    int line;//текущая строка в файле (начинается с 1)
-    int col;//текущий столбец в строке (начинается с 1)
+    std::string src;//исходный текст файла
+    std::string file;//имя файла
+    size_t pos;//текущая позиция в тексте
+    int line;//текущая строка
+    int col;//текущая колонка
 
-    //вспомогательный метод: посмотреть символ вперед на offset позиций без сдвига основного указателя
-    char peek(size_t offset = 0) const {
-        if (pos + offset >= src.size()) return '\0';//если выходим за границы текста, возвращаем нулевой символ
-        return src[pos + offset];//возвращаем символ по смещенному индексу
+    char peek(size_t offset = 0) const {//посмотреть символ впереди без сдвига
+        if (pos + offset >= src.size()) return '\0';//если за концом файла, вернуть нулевой символ
+        return src[pos + offset];//вернуть символ по смещению
     }
 
-    //вспомогательный метод: сдвинуть указатель позиции вперед на один символ с обновлением строки и колонки
-    void advance() {
-        if (pos < src.size()) {//если еще не конец текста
-            if (src[pos] == '\n') { line++; col = 1; }//если встретили перенос строки, увеличиваем номер строки и сбрасываем колонку на 1
-            else { col++; }//иначе просто сдвигаем колонку на один символ вправо
-            pos++;//увеличиваем общий индекс позиции
+    void advance() {//сдвинуть позицию на один символ
+        if (pos < src.size()) {//если не конец файла
+            if (src[pos] == '\n') { line++; col = 1; }//если перенос строки, увеличиваем строку и сбрасываем колонку
+            else { col++; }//иначе увеличиваем колонку
+            pos++;//увеличиваем позицию
         }
     }
 
-    //вспомогательный метод для пропуска пробельных символов и комментариев
-    void skipWhitespaceAndComments() {
-        while (pos < src.size()) {//крутим цикл, пока не упремся в значащий символ или конец файла
-            char c = src[pos];//берем текущий символ
-            if (std::isspace(static_cast<unsigned char>(c))) {
-                advance();//если это пробел, табуляция или перенос — пропускаем его
-            } else if (c == '/' && peek(1) == '/') {//если встретили начало однострочного комментария "//"
-                while (pos < src.size() && src[pos] != '\n') advance();//пропускаем все символы до конца текущей строки
-            } else if (c == '/' && peek(1) == '*') {//если встретили начало многострочного комментария "/*"
-                int depth = 1;//устанавливаем глубину вложенности комментариев в 1
-                advance(); advance();//пропускаем символы '/' и '*'
-                while (pos < src.size() && depth > 0) {//крутим цикл, пока не закроются все вложенные комментарии
-                    if (src[pos] == '/' && peek(1) == '*') {//если внутри встретился еще один вложенный комментарий "/*"
-                        depth++; advance(); advance();//увеличиваем глубину вложенности и пропускаем маркер
-                    } else if (src[pos] == '*' && peek(1) == '/') {//если встретился конец комментария "*/"
-                        depth--; advance(); advance();//уменьшаем глубину вложенности и пропускаем маркер
+    void skipWhitespaceAndComments() {//пропустить пробелы и комментарии
+        while (pos < src.size()) {//пока не конец файла
+            char c = src[pos];//берём текущий символ
+            if (std::isspace(static_cast<unsigned char>(c))) {//если пробел/таб/перенос
+                advance();//пропускаем
+            } else if (c == '/' && peek(1) == '/') {//если однострочный комментарий //
+                while (pos < src.size() && src[pos] != '\n') advance();//пропускаем до конца строки
+            } else if (c == '/' && peek(1) == '*') {//если многострочный комментарий /*
+                int depth = 1;//счётчик вложенности
+                advance(); advance();//пропускаем /*
+                while (pos < src.size() && depth > 0) {//пока не закроются все комментарии
+                    if (src[pos] == '/' && peek(1) == '*') {//если вложенный /*
+                        depth++; advance(); advance();//увеличиваем глубину
+                    } else if (src[pos] == '*' && peek(1) == '/') {//если закрывающий */
+                        depth--; advance(); advance();//уменьшаем глубину
                     } else {
-                        advance();//иначе просто пропускаем обычный символ внутри комментария
+                        advance();//иначе просто идём дальше
                     }
                 }
-                if (depth > 0) {//если после конца файла глубина осталась больше нуля (комментарий не закрыт)
-                    throw std::runtime_error(//выбрасываем фатальную ошибку
-                        "Незакрытый многострочный комментарий в " + file +
-                        " строка " + std::to_string(line));
+                if (depth > 0) {//если дошли до конца, а комментарий не закрыт
+                    throw std::runtime_error("Незакрытый многострочный комментарий в " + file + " строка " + std::to_string(line));//это фатальная ошибка
                 }
             } else {
-                break;//если это не пробел и не комментарий, прекращаем пропуск и выходим из цикла
+                break;//если это не пробел и не комментарий, выходим из цикла
             }
         }
     }
 
-    //добавлено: чтение raw-идентификатора в backticks (`class`, `if`, `100`).
-    //по спецификации Swift: "to use a reserved word as an identifier or to include special
-    //characters like whitespace, put a backtick (`) before and after it."
-    //возвращает содержимое БЕЗ самих backticks (по спецификации они не часть идентификатора)
-    std::string readRawIdentifier() {
-        std::string result;//строка для накопления содержимого
-        advance();//пропускаем открывающий backtick
-        while (pos < src.size()) {//читаем до закрывающего backtick или конца файла
+    std::string readHashKeyword() {//прочитать #-ключевое слово или вернуть пустую строку, если это не оно
+        size_t savedPos = pos;//запоминаем позицию для отката
+        int savedLine = line;//запоминаем строку
+        int savedCol = col;//запоминаем колонку
+        std::string result;//строка результата
+        result += '#';//берём решётку
+        advance();//сдвигаемся
+        if (!std::isalpha(static_cast<unsigned char>(peek()))) {//если после # не буква
+            pos = savedPos; line = savedLine; col = savedCol;//откатываемся
+            return "";//это не #-ключевое слово
+        }
+        while (pos < src.size()) {//читаем буквы и цифры
             char c = peek();
-            if (c == '`') {//если встретили закрывающий backtick
-                advance();//пропускаем его
-                return result;//возвращаем накопленное содержимое
-            } else if (c == '\n') {//если встретили перенос строки — это ошибка
-                throw std::runtime_error(
-                    "Незакрытый raw-идентификатор в " + file +
-                    " строка " + std::to_string(line));
-            } else {
-                result += c; advance();//иначе добавляем символ в результат
-            }
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
+                result += c; advance();
+            } else break;//если не буква и не цифра, стоп
         }
-        //если дошли до конца файла — ошибка
-        throw std::runtime_error(
-            "Незакрытый raw-идентификатор в " + file +
-            " строка " + std::to_string(line));
+        return result;//например "#available"
     }
 
-    //вспомогательный метод для чтения числовых литералов
-    //обновлено: добавлена поддержка hex-float (например, 0xFp2, 0x1.8p-3)
-    std::string readNumber() {
-        std::string result;//строка для накопления числа
-        //проверяем, является ли число литералом в нестандартной системе счисления (0x, 0o, 0b)
-        if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X' ||
-                              peek(1) == 'o' || peek(1) == 'O' ||
-                              peek(1) == 'b' || peek(1) == 'B')) {
-            char base = peek(1);//запоминаем букву системы счисления (x, o или b)
-            result += peek(); advance();//добавляем '0' и сдвигаем указатель
-            result += peek(); advance();//добавляем букву системы и сдвигаем указатель
+    std::string readDollarIdentifier() {//прочитать $-идентификатор ($0, $1, $published)
+        std::string result = "$";//начинаем с доллара
+        advance();//сдвигаемся
+        while (pos < src.size()) {//читаем цифры и буквы
+            char c = peek();
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
+                result += c; advance();
+            } else break;//если не подходит, стоп
+        }
+        return result;//например "$0"
+    }
 
+    std::string readRawIdentifier() {//прочитать raw-идентификатор в backticks
+        std::string result;//строка результата
+        advance();//пропускаем открывающий `
+        while (pos < src.size()) {//читаем до закрывающего `
+            char c = peek();
+            if (c == '`') {//если закрывающий backtick
+                advance();//пропускаем
+                return result;//возвращаем содержимое без backticks
+            } else if (c == '\n') {//если перенос строки, ошибка
+                throw std::runtime_error("Незакрытый raw-идентификатор в " + file + " строка " + std::to_string(line));
+            } else {
+                result += c; advance();//добавляем символ
+            }
+        }
+        throw std::runtime_error("Незакрытый raw-идентификатор в " + file + " строка " + std::to_string(line));//дошли до конца, не закрыли
+    }
+
+    std::string readNumber() {//прочитать число во всех формах
+        std::string result;//строка результата
+        if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X' || peek(1) == 'o' || peek(1) == 'O' || peek(1) == 'b' || peek(1) == 'B')) {//если префикс 0x/0o/0b
+            char base = peek(1);//запоминаем систему счисления
+            result += peek(); advance();//добавляем 0
+            result += peek(); advance();//добавляем букву системы
             //читаем целую часть числа в соответствующей системе счисления
             while (pos < src.size()) {
                 char c = peek();
+                //для hex запрещаем читать p/P как часть целой части — это начало экспоненты
+                //без этого 0xFp-2 разобьётся на 0xFp + - + 2 вместо одного числа
+                if ((base == 'x' || base == 'X') && (c == 'p' || c == 'P')) break;
                 if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
                     result += c; advance();
                 } else break;
             }
-
-            //добавлено: для hex-float читаем дробную часть (.8) и экспоненту (p2 или p-3)
-            //применяется ТОЛЬКО для 0x-литералов (по спецификации hex-float это 0x...p...)
-            if ((base == 'x' || base == 'X') && peek() == '.') {
-                //проверяем, есть ли после точки hex-цифра
-                if (std::isxdigit(static_cast<unsigned char>(peek(1)))) {
+            if ((base == 'x' || base == 'X') && peek() == '.') {//если hex-float с дробной частью
+                if (std::isxdigit(static_cast<unsigned char>(peek(1)))) {//если после точки есть hex-цифра
                     result += peek(); advance();//добавляем точку
-                    while (pos < src.size() &&
-                           (std::isxdigit(static_cast<unsigned char>(peek())) || peek() == '_')) {
-                        result += peek(); advance();//добавляем hex-цифры после точки
+                    while (pos < src.size() && (std::isxdigit(static_cast<unsigned char>(peek())) || peek() == '_')) {
+                        result += peek(); advance();//читаем hex-цифры после точки
                     }
                 }
             }
-            //читаем экспоненту: p или P, затем опциональный знак, затем десятичные цифры
-            if ((base == 'x' || base == 'X') &&
-                (peek() == 'p' || peek() == 'P') &&
-                (std::isdigit(static_cast<unsigned char>(peek(1))) ||
-                 ((peek(1) == '+' || peek(1) == '-') &&
-                  std::isdigit(static_cast<unsigned char>(peek(2)))))) {
-                result += peek(); advance();//добавляем 'p' или 'P'
-                if (peek() == '+' || peek() == '-') {//если есть знак у экспоненты
-                    result += peek(); advance();//добавляем знак
+            if ((base == 'x' || base == 'X') && (peek() == 'p' || peek() == 'P')) {//если hex-float с экспонентой p
+                char afterP = peek(1);//смотрим, что идёт после p
+                bool validExp = false;//флаг, что экспонента валидна
+                if (std::isdigit(static_cast<unsigned char>(afterP))) {//p + цифра
+                    validExp = true;
+                } else if ((afterP == '+' || afterP == '-') && std::isdigit(static_cast<unsigned char>(peek(2)))) {//p + знак + цифра
+                    validExp = true;
                 }
-                while (pos < src.size() &&
-                       std::isdigit(static_cast<unsigned char>(peek()))) {
-                    result += peek(); advance();//читаем десятичные цифры экспоненты
+                if (validExp) {
+                    result += peek(); advance();//добавляем p или P
+                    if (peek() == '+' || peek() == '-') { result += peek(); advance(); }//добавляем знак
+                    while (pos < src.size() && std::isdigit(static_cast<unsigned char>(peek()))) {
+                        result += peek(); advance();//читаем десятичные цифры экспоненты
+                    }
                 }
             }
-            return result;//возвращаем готовое число
+            return result;//возвращаем число
         }
-
-        //читаем обычные числа (целые или с плавающей точкой)
-        while (pos < src.size()) {
+        while (pos < src.size()) {//читаем обычное число
             char c = peek();
             if (std::isdigit(static_cast<unsigned char>(c)) || c == '_') {
-                result += c; advance();//захватываем цифры и разделители разрядов '_'
-            } else if (c == '.' &&
-                       std::isdigit(static_cast<unsigned char>(peek(1)))) {//если встретили точку, за которой идет цифра (дробная часть)
+                result += c; advance();//добавляем цифры
+            } else if (c == '.' && std::isdigit(static_cast<unsigned char>(peek(1)))) {//если дробная часть
                 result += c; advance();//добавляем точку
-                while (pos < src.size() &&
-                       (std::isdigit(static_cast<unsigned char>(peek())) ||
-                        peek() == '_')) {
-                    result += peek(); advance();//дочитываем цифры после точки
+                while (pos < src.size() && (std::isdigit(static_cast<unsigned char>(peek())) || peek() == '_')) {
+                    result += peek(); advance();//читаем цифры после точки
                 }
-            } else if ((c == 'e' || c == 'E') &&//поддержка научной нотации (экспоненты, например 1e10)
-                       (std::isdigit(static_cast<unsigned char>(peek(1))) ||
-                        ((peek(1) == '+' || peek(1) == '-') &&
-                         std::isdigit(static_cast<unsigned char>(peek(2)))))) {
-                result += c; advance();//добавляем 'e' или 'E'
-                if (peek() == '+' || peek() == '-') {//если есть знак плюс или минус у экспоненты
-                    result += peek(); advance();//добавляем знак
+            } else if ((c == 'e' || c == 'E') && (std::isdigit(static_cast<unsigned char>(peek(1))) || ((peek(1) == '+' || peek(1) == '-') && std::isdigit(static_cast<unsigned char>(peek(2)))))) {//если экспонента e
+                result += c; advance();//добавляем e
+                if (peek() == '+' || peek() == '-') { result += peek(); advance(); }//добавляем знак
+                while (pos < src.size() && std::isdigit(static_cast<unsigned char>(peek()))) {
+                    result += peek(); advance();//читаем цифры экспоненты
                 }
-                while (pos < src.size() &&
-                       std::isdigit(static_cast<unsigned char>(peek()))) {
-                    result += peek(); advance();//дочитываем цифры экспоненты
-                }
-            } else break;//если символ не относится к числу, прекращаем чтение
+            } else break;//если не подходит, стоп
         }
-        return result;//возвращаем считанное число
+        return result;//возвращаем число
     }
 
-    //вспомогательный метод для чтения строковых литералов
-    //обновлено: добавлена поддержка многострочных строк """..."""
-    std::string readString() {
-        std::string result;//строка для результата
-
-        //добавлено: проверка на многострочную строку """..."""
-        if (peek() == '"' && peek(1) == '"' && peek(2) == '"') {
-            //захватываем открывающие три кавычки
-            result += "\"\"\""; advance(); advance(); advance();
-
-            //читаем до закрывающих трёх кавычек
-            while (pos < src.size()) {
-                if (peek() == '"' && peek(1) == '"' && peek(2) == '"') {
-                    result += "\"\"\""; advance(); advance(); advance();
-                    return result;//успешно закрыли многострочную строку
+    std::string readString() {//прочитать строку: обычную, многострочную или extended #"..."#
+        if (peek() == '#' && peek(1) == '"') {//если это extended-строка #"..."#
+            int hashCount = 0;//считаем количество # перед кавычкой
+            while (peek() == '#') { hashCount++; advance(); }//считаем решётки
+            advance();//пропускаем открывающую кавычку
+            std::string closing = "\"" + std::string(hashCount, '#');//формируем закрывающую последовательность
+            std::string result = std::string(hashCount, '#') + "\"";//начало результата
+            while (pos < src.size()) {//читаем до закрывающей последовательности
+                if (src.compare(pos, closing.size(), closing) == 0) {//если встретили закрывашку
+                    result += closing;//добавляем её
+                    for (size_t i = 0; i < closing.size(); ++i) advance();//сдвигаемся на её длину
+                    return result;//возвращаем строку
                 }
-                result += peek(); advance();//добавляем любой символ, включая переводы строк
+                result += peek(); advance();//иначе добавляем символ
             }
-            //если дошли до конца файла — ошибка
-            throw std::runtime_error(
-                "Незакрытая многострочная строка в " + file +
-                " строка " + std::to_string(line));
+            throw std::runtime_error("Незакрытая extended-строка в " + file + " строка " + std::to_string(line));//дошли до конца, не закрыли
         }
 
-        //обычная однострочная строка
-        result += '"'; advance();//захватываем открывающую кавычку и сдвигаем позицию
+        if (peek() == '"' && peek(1) == '"' && peek(2) == '"') {//если многострочная строка """..."""
+            std::string result = "\"\"\"";//начало
+            advance(); advance(); advance();//пропускаем три кавычки
+            while (pos < src.size()) {//читаем до трёх кавычек
+                if (peek() == '"' && peek(1) == '"' && peek(2) == '"') {//если нашли """
+                    result += "\"\"\"";//добавляем
+                    advance(); advance(); advance();//сдвигаемся
+                    return result;//возвращаем строку
+                }
+                result += peek(); advance();//иначе добавляем символ
+            }
+            throw std::runtime_error("Незакрытая многострочная строка в " + file + " строка " + std::to_string(line));//не закрыли
+        }
 
-        while (pos < src.size()) {//читаем текст внутри строки до закрывающей кавычки
+        std::string result;//для обычной строки
+        result += '"'; advance();//берём открывающую кавычку
+        while (pos < src.size()) {//читаем до закрывающей
             char c = peek();
-            if (c == '\\') {//если встретился символ экранирования "\"
+            if (c == '\\') {//если экранирование
                 result += c; advance();//добавляем слэш
-                if (pos < src.size()) {
-                    result += peek(); advance();//добавляем следующий за ним экранированный символ
-                }
-            } else if (c == '"') {//если встретилась закрывающая кавычка
-                result += c; advance();//добавляем её и завершаем чтение строки
-                return result;
-            } else if (c == '\n') {//если внутри строки обнаружился перенос строки без закрытия (ошибка)
-                throw std::runtime_error(
-                    "Незакрытая строка в " + file +
-                    " строка " + std::to_string(line));
+                if (pos < src.size()) { result += peek(); advance(); }//и экранируемый символ
+            } else if (c == '"') {//если закрывающая кавычка
+                result += c; advance();//добавляем
+                return result;//возвращаем строку
+            } else if (c == '\n') {//если перенос строки, ошибка
+                throw std::runtime_error("Незакрытая строка в " + file + " строка " + std::to_string(line));
             } else {
-                result += c; advance();//добавляем обычный символ в тело строки
+                result += c; advance();//добавляем обычный символ
             }
         }
-        //если дошли до конца файла, а строка так и не закрылась — выбрасываем исключение
-        throw std::runtime_error(
-            "Незакрытая строка в " + file +
-            " строка " + std::to_string(line));
+        throw std::runtime_error("Незакрытая строка в " + file + " строка " + std::to_string(line));//не закрыли
     }
 
-    //вспомогательный метод для чтения идентификаторов (имен переменных/функций)
-    std::string readIdentifier() {
-        std::string result;//строка для накопления букв идентификатора
-        while (pos < src.size()) {
+    std::string readIdentifier() {//прочитать слово (идентификатор или ключевое слово)
+        std::string result;//строка результата
+        while (pos < src.size()) {//пока не конец
             char c = peek();
-            //идентификатор может состоять из букв, цифр и знаков подчеркивания
-            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
-                result += c; advance();//захватываем символ
-            } else break;//прекращаем чтение, когда кончился идентификатор
+            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {//если буква, цифра или _
+                result += c; advance();//добавляем
+            } else break;//иначе стоп
         }
-        return result;//возвращаем полученное имя
+        return result;//возвращаем слово
     }
 
-    //вспомогательный метод для чтения многосимвольных и одиночных операторов или разделителей
-    std::string readOperatorOrDelimiter() {
-        //статический массив всех возможных многосимвольных операторов в Swift
-        static const std::vector<std::string> multiOps = {
+    std::string readOperatorOrDelimiter() {//прочитать оператор или разделитель
+        static const std::vector<std::string> multiOps = {//список многосимвольных операторов, важен порядок: сначала длинные
             "...", "..<", "===", "!==", "->", "??", "&&", "||",
             "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=",
             "<<", ">>", "&=", "|=", "^="
         };
-        //проверяем, начинается ли текущий текст с какого-то из известных многосимвольных операторов
-        for (const auto& op : multiOps) {
-            if (src.compare(pos, op.size(), op) == 0) {//если совпало...
-                for (size_t i = 0; i < op.size(); ++i) advance();//сдвигаем позицию на всю длину оператора
-                return op;//возвращаем найденный оператор
+        for (const auto& op : multiOps) {//проходим по списку
+            if (src.compare(pos, op.size(), op) == 0) {//если текущий текст совпал
+                for (size_t i = 0; i < op.size(); ++i) advance();//сдвигаемся на длину оператора
+                return op;//возвращаем оператор
             }
         }
-        char c = peek();//если многосимвольный не подошел, проверяем одиночные специальные символы
-        //если символ входит в перечень допустимых символов знаков препинания и операций
-        if (std::string("+-*/%=<>!&|^~?:.,;(){}[]@#").find(c)
-            != std::string::npos) {
-            std::string result(1, c);//создаем строку из одного символа
-            advance();//сдвигаем позицию вперед
-            return result;//возвращаем одиночный оператор/разделитель
+        char c = peek();//если многосимвольный не подошёл, проверяем одиночный
+        if (std::string("+-*/%=<>!&|^~?:.,;(){}[]@#").find(c) != std::string::npos) {//если символ из списка
+            std::string result(1, c);//делаем строку из одного символа
+            advance();//сдвигаемся
+            return result;//возвращаем
         }
-        return "";//если это не оператор и не разделитель, возвращаем пустую строку
+        return "";//не оператор и не разделитель
     }
 };
